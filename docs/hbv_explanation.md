@@ -17,6 +17,22 @@ implementation mirrors the hydrological HBV model described by Feng et al. (2022
   * `internal_states`: the full time evolution of each state variable,
   * `final_states`: the state values in the last simulated time step.
 
+## Differentiability in practice
+
+The implementation stays entirely within PyTorch tensor operations, so every arithmetic update in
+the snow, soil, and groundwater modules participates in automatic differentiation. No NumPy
+conversions or detached tensors appear inside the time-step loop. Even conditional behavior such as
+freeze/melt partitioning is handled through differentiable primitives like boolean masking and
+`torch.clamp`, so gradients continue to flow to all upstream inputs and parameters. The only hard
+floor that is applied is `SM = torch.clamp(SM - ETact, min=1e-5)`, which prevents the soil-moisture
+store from reaching exactly zero (a situation that can cause vanishing gradients) while remaining
+compatible with autograd.
+
+Because the entire `forward` routine is differentiable, `torch.autograd` can compute gradients of a
+loss with respect to both the conceptual-model parameters and any neural network that provides those
+parameters. This is the mechanism that makes the HBV component “differentiable” and suitable for
+hybrid learning setups.
+
 ## Forcing inputs and preprocessing
 
 * `x_conceptual` is expected to contain precipitation, potential evapotranspiration, and
@@ -91,3 +107,25 @@ The model advances states sequentially over the time dimension.
 
 These ranges mirror typical HBV calibration limits and can be used for parameter regularization or
 constrained optimization during training.
+
+## Static versus dynamic parameterization
+
+`parameter_type` controls whether each HBV parameter is treated as static (time-invariant within a
+simulation window) or dynamic (allowed to vary at every step). Regardless of type, the parameters are
+passed into `forward` as tensors, so they remain differentiable.
+
+* **Static parameters** typically originate from learnable tensors registered on the
+  `BaseConceptualModel` (for example as `nn.Parameter`s). During training, gradient signals coming
+  from the loss backpropagate through the HBV computations to those tensors. Updating them is then a
+  matter of running an optimizer such as Adam or SGD over the conceptual-model parameters—exactly the
+  same workflow as calibrating a neural network weight.
+* **Dynamic parameters** are usually predicted by an upstream network (e.g., an LSTM or transformer)
+  that consumes meteorological forcings or catchment attributes. The chosen entries in
+  `parameter_type` tell the base class to request a full `[batch, time, n_models]` trajectory instead
+  of a single static value. Because the HBV equations are differentiable, gradients propagate back
+  through the dynamic parameter tensors into the weights of that upstream network, enabling their
+  end-to-end training.
+
+In short, both static and dynamic parameter updates leverage the same backpropagation path; the only
+difference is whether the learnable quantities live directly on the HBV module (static) or inside an
+external network that outputs time-varying parameter fields (dynamic).
